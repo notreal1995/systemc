@@ -61,6 +61,11 @@
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#ifdef SC_ENABLE_PARALLEL_EVALUATION
+#  include <atomic>
+#  include <thread>
+#  include <vector>
+#endif
 
 // DEBUGGING MACROS:
 //
@@ -512,33 +517,90 @@ sc_simcontext::crunch( bool once )
 
 	    // execute method processes
 
-	    m_runnable->toggle_methods();
-	    sc_method_handle method_h = pop_runnable_method();
-	    while( method_h != 0 ) {
-		empty_eval_phase = false;
-		if ( !method_h->run_process() )
-		{
-		    goto out;
-		}
-		method_h = pop_runnable_method();
-	    }
+            m_runnable->toggle_methods();
+            sc_method_handle method_h = pop_runnable_method();
+#ifdef SC_ENABLE_PARALLEL_EVALUATION
+            std::vector<sc_method_handle> method_handles;
+            while ( method_h != 0 ) {
+                method_handles.push_back( method_h );
+                method_h = pop_runnable_method();
+            }
+            if ( !method_handles.empty() ) {
+                empty_eval_phase = false;
+                std::atomic<bool> failed( false );
+                std::vector<std::thread> threads;
+                threads.reserve( method_handles.size() );
+                for ( sc_method_handle mh : method_handles ) {
+                    threads.emplace_back( [mh, &failed]() {
+                        if ( !mh->run_process() ) {
+                            failed = true;
+                        }
+                    } );
+                }
+                for ( std::thread& t : threads ) {
+                    t.join();
+                }
+                if ( failed ) {
+                    goto out;
+                }
+            }
+#else
+            while( method_h != 0 ) {
+                empty_eval_phase = false;
+                if ( !method_h->run_process() )
+                {
+                    goto out;
+                }
+                method_h = pop_runnable_method();
+            }
+#endif
 
-	    // execute (c)thread processes
+            // execute (c)thread processes
 
-	    m_runnable->toggle_threads();
-	    sc_thread_handle thread_h = pop_runnable_thread();
-	    while( thread_h != 0 ) {
+            m_runnable->toggle_threads();
+            sc_thread_handle thread_h = pop_runnable_thread();
+#ifdef SC_ENABLE_PARALLEL_EVALUATION
+            std::vector<sc_thread_handle> thread_handles;
+            while( thread_h != 0 ) {
+                if ( thread_h->m_cor_p != NULL ) {
+                    thread_handles.push_back( thread_h );
+                }
+                thread_h = pop_runnable_thread();
+            }
+            if ( !thread_handles.empty() ) {
+                empty_eval_phase = false;
+                std::atomic<bool> failed( false );
+                std::vector<std::thread> threads;
+                threads.reserve( thread_handles.size() );
+                for ( sc_thread_handle th : thread_handles ) {
+                    threads.emplace_back( [this, th, &failed]() {
+                        m_cor_pkg->yield( th->m_cor_p );
+                        if ( m_error ) {
+                            failed = true;
+                        }
+                    } );
+                }
+                for ( std::thread& t : threads ) {
+                    t.join();
+                }
+                if ( failed ) {
+                    goto out;
+                }
+            }
+#else
+            while( thread_h != 0 ) {
                 if ( thread_h->m_cor_p != NULL ) break;
-		thread_h = pop_runnable_thread();
-	    }
+                thread_h = pop_runnable_thread();
+            }
 
-	    if( thread_h != 0 ) {
-	        empty_eval_phase = false;
-		m_cor_pkg->yield( thread_h->m_cor_p );
-	    }
-	    if( m_error ) {
-		goto out;
-	    }
+            if( thread_h != 0 ) {
+                empty_eval_phase = false;
+                m_cor_pkg->yield( thread_h->m_cor_p );
+            }
+#endif
+            if( m_error ) {
+                goto out;
+            }
 
 	    // check for call(s) to sc_stop
 	    if( m_forced_stop ) {
